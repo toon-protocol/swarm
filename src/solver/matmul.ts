@@ -18,10 +18,17 @@ import { type Solver, type Submission, submissionFromBytes } from './types.js';
 
 /** RISC Zero image id of the matmul guest (capability-market ARTIFACTS.json). */
 export const MATMUL_IMAGE_ID: Hex =
-  '0x660d47e33136b07e362d5efac8669ee3d31603df5aa5c12dba41f91156e8ecff';
+  '0x80db88cd4190c8adf12b58c2aca51812b7a3ca82fa04a0a61c8f91b9dc9985b2';
 
 /** The flagship market's pinned rank bound (the open target). */
 export const FLAGSHIP_RANK_BOUND = 46;
+
+/**
+ * Deadline literal pinned into the flagship manifest (capability-market's
+ * e2e-prover `--frozen-clock` default = 2025-01-01T00:00:00Z). The launch
+ * verdict is time-independent; the value only participates in the manifest hash.
+ */
+export const FLAGSHIP_FROZEN_CLOCK = 1735689600n;
 
 const ENTRIES = 16;
 
@@ -107,9 +114,117 @@ export function encodeMarketParams(bound: number): Uint8Array {
   return out;
 }
 
-/** `sha256(encodeMarketParams(bound))` — matches the on-chain marketParamsHash. */
-export function marketParamsHash(bound: number): Hex {
-  return sha256(toHex(encodeMarketParams(bound)));
+// ---------------------------------------------------------------------------
+// manifest-v1 canonical input manifest (toon-meta#121, resolves capability-market#4)
+//
+// The guest no longer reads the raw 32-byte params directly. It reads a
+// canonical `manifest-v1` TLV — a faithful port of capability-market's
+// `predicates/crates/manifest` — and commits
+// `market_params_hash = sha256(manifest bytes)`, NOT `sha256(raw params)`. The
+// rank bound rides as the `market_params` VALUE entry; the deadline as the
+// `frozen_clock` VALUE; the late-bound submission as a `submission` SLOT.
+//
+//   magic "TMF1" ‖ entry_count(u16 LE) ‖ entries…
+//   entry = kind(u8) ‖ name_len(u16 LE) ‖ name ‖ data_len(u32 LE) ‖ data
+//     HASH(0x01): 32-byte data   VALUE(0x02): literal bytes   SLOT(0x03): no data
+//   entries emitted in STRICTLY ASCENDING name order (bytewise), names unique.
+// ---------------------------------------------------------------------------
+
+/** manifest-v1 magic / version tag ("TMF1"). */
+export const MANIFEST_MAGIC = new Uint8Array([0x54, 0x4d, 0x46, 0x31]);
+/** manifest-v1 entry-kind discriminants. */
+export const MANIFEST_KIND = { HASH: 0x01, VALUE: 0x02, SLOT: 0x03 } as const;
+/** Matmul manifest entry names (must match matmul::MANIFEST_*). */
+export const MANIFEST_MARKET_PARAMS = 'market_params';
+export const MANIFEST_FROZEN_CLOCK = 'frozen_clock';
+export const MANIFEST_SUBMISSION = 'submission';
+
+export interface ManifestEntry {
+  name: string;
+  kind: number;
+  /** Present for VALUE/HASH entries; omitted for SLOT. HASH data must be 32 bytes. */
+  data?: Uint8Array;
+}
+
+const NAME_ENCODER = new TextEncoder();
+const u16le = (n: number): number[] => [n & 0xff, (n >> 8) & 0xff];
+const u32le = (n: number): number[] => [n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff, (n >>> 24) & 0xff];
+function u64le(v: bigint): Uint8Array {
+  const out = new Uint8Array(8);
+  let x = v;
+  for (let i = 0; i < 8; i++) {
+    out[i] = Number(x & 0xffn);
+    x >>= 8n;
+  }
+  return out;
+}
+
+/** Encode canonical `manifest-v1` bytes. Sorts entries into ascending name order. */
+export function encodeManifest(entries: ManifestEntry[]): Uint8Array {
+  if (entries.length === 0) throw new Error('manifest must have at least one entry');
+  const named = entries.map((e) => ({ e, nb: NAME_ENCODER.encode(e.name) }));
+  for (const { e, nb } of named) {
+    if (nb.length < 1 || nb.length > 0xffff) {
+      throw new Error(`entry name ${JSON.stringify(e.name)} must be 1..=65535 bytes`);
+    }
+    if (e.kind === MANIFEST_KIND.HASH && (!e.data || e.data.length !== 32)) {
+      throw new Error(`HASH entry ${JSON.stringify(e.name)} must carry 32 bytes`);
+    }
+  }
+  // Canonical order: strictly ascending by UTF-8 name bytes (also rejects dups).
+  named.sort((a, b) => compareBytes(a.nb, b.nb));
+  for (let i = 1; i < named.length; i++) {
+    if (compareBytes(named[i - 1]!.nb, named[i]!.nb) === 0) {
+      throw new Error(`duplicate entry name ${JSON.stringify(named[i]!.e.name)}`);
+    }
+  }
+
+  const out: number[] = [...MANIFEST_MAGIC, ...u16le(named.length)];
+  for (const { e, nb } of named) {
+    out.push(e.kind, ...u16le(nb.length), ...nb);
+    if (e.kind === MANIFEST_KIND.SLOT) {
+      out.push(...u32le(0));
+    } else {
+      const data = e.data ?? new Uint8Array(0);
+      out.push(...u32le(data.length), ...data);
+    }
+  }
+  return new Uint8Array(out);
+}
+
+function compareBytes(a: Uint8Array, b: Uint8Array): number {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    if (a[i]! !== b[i]!) return a[i]! - b[i]!;
+  }
+  return a.length - b.length;
+}
+
+/**
+ * Build the canonical matmul input manifest for a market — the exact bytes
+ * capability-market's `matmul::encode_manifest(bound, frozenClock)` produces.
+ * `sha256` of the result is the market's `marketParamsHash`.
+ */
+export function encodeMatmulManifest(
+  bound: number,
+  frozenClock: bigint = FLAGSHIP_FROZEN_CLOCK,
+): Uint8Array {
+  return encodeManifest([
+    { name: MANIFEST_MARKET_PARAMS, kind: MANIFEST_KIND.VALUE, data: encodeMarketParams(bound) },
+    { name: MANIFEST_FROZEN_CLOCK, kind: MANIFEST_KIND.VALUE, data: u64le(frozenClock) },
+    { name: MANIFEST_SUBMISSION, kind: MANIFEST_KIND.SLOT },
+  ]);
+}
+
+/**
+ * `sha256(canonical manifest-v1 bytes)` — the on-chain `marketParamsHash`
+ * (toon-meta#121 / capability-market#4). NOT `sha256(raw params)`.
+ */
+export function marketParamsHash(
+  bound: number,
+  frozenClock: bigint = FLAGSHIP_FROZEN_CLOCK,
+): Hex {
+  return sha256(toHex(encodeMatmulManifest(bound, frozenClock)));
 }
 
 export type Reject =
@@ -169,9 +284,10 @@ function checkIdentity(triples: Triple[]): Reject | null {
 /**
  * The matmul reference solver. Keyed by {@link MATMUL_IMAGE_ID}.
  *
- * Because a market stores only `sha256(params)` on-chain (not the raw bound),
- * the solver needs the params preimage to know the market's rank bound. It
- * keeps a small registry of known bounds (seed it with {@link registerBound}).
+ * Because a market stores only `sha256(manifest)` on-chain (not the raw bound),
+ * the solver needs the manifest preimage to know the market's rank bound. It
+ * keeps a small registry of known bounds (seed it with {@link registerBound}),
+ * mapping each to its `marketParamsHash = sha256(manifest-v1 bytes)`.
  * The flagship bound 46 is pre-registered — and correctly yields `null`, since
  * the rank-49 scheme does not beat 46.
  *

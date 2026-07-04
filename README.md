@@ -65,7 +65,7 @@ note:    rank-49 Strassen⊗Strassen, valid at bound 49 (49 products)
 reveal plan (spend-free):
   submissionHash: 0x89c4…1ece
   commitmentHash: 0x2bc2…4b5f
-  journal:        0x660d47e3…01   (image_id ‖ paramsHash ‖ submissionHash ‖ verdict=01)
+  journal:        0x80db88cd…01   (image_id ‖ paramsHash ‖ submissionHash ‖ verdict=01)
   seal:           0xffffffff…      (36 bytes, RiscZeroMockVerifier)
 ```
 
@@ -116,7 +116,9 @@ behind the explicit `--submit` gate — run the live commit/reveal.
    arweaveTx, minerAddr, salt))`. The miner address in the preimage is the
    commit-reveal front-running defense.
 4. **prove** — build the canonical 97-byte journal
-   (`imageId ‖ sha256(params) ‖ submissionHash ‖ verdict`) and produce a seal the
+   (`imageId ‖ sha256(manifest) ‖ submissionHash ‖ verdict`, where
+   `market_params_hash = sha256(canonical manifest-v1 bytes)` per toon-meta#121 /
+   capability-market#4 — NOT `sha256(raw params)`) and produce a seal the
    market's RISC Zero verifier accepts.
 5. **reveal** — `reveal(marketId, solutionHash, arweaveTx, salt, proof, journal)`.
 
